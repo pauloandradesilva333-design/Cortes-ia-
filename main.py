@@ -258,3 +258,18 @@ async function poll(id){
 @app.get("/", response_class=HTMLResponse)
 def home():
     return PAGE
+@app.get("/testar")
+def testar():
+    k = GROQ_KEY
+    info = {
+        "tamanho_da_chave": len(k),
+        "comeca_com_gsk": k.startswith("gsk_"),
+        "tem_espaco_sobrando": k != k.strip(),
+    }
+    try:
+        r = httpx.get("https://api.groq.com/openai/v1/models", headers=auth(), timeout=20)
+        info["groq_status"] = r.status_code
+        info["groq_resposta"] = r.text[:300]
+    except Exception as e:
+        info["erro"] = str(e)
+    return info
