@@ -32,6 +32,7 @@ class JobIn(BaseModel):
     cam_y: float = 0.7
     cam_w: float = 0.3
     cam_h: float = 0.3
+    fast: bool = True
 
 
 def run(cmd, cwd=None):
@@ -128,6 +129,16 @@ def write_srt(segs, a, b, path: Path):
 
 def cut(video, d, idx, a, b, srt_name, p: JobIn):
     out = f"clip_{idx}.mp4"
+    if p.fast:
+        run(
+            [
+                "ffmpeg", "-loglevel", "error", "-nostats", "-y",
+                "-ss", str(a), "-i", str(video), "-t", str(round(b - a, 2)),
+                "-c", "copy", "-movflags", "+faststart", out,
+            ],
+            cwd=d,
+        )
+        return out
     style = "FontName=DejaVu Sans,FontSize=11,Bold=1,Alignment=2,MarginV=130,Outline=2,Shadow=0"
     fc = (
         "[0:v]split=2[a][b];"
@@ -161,7 +172,7 @@ def work(job_id, p: JobIn):
         a = int(p.start_min * 60)
         b = a + int(p.max_min * 60)
         run([
-            "yt-dlp", "--no-progress", "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+            "yt-dlp", "--no-progress", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
             "--merge-output-format", "mp4",
             "--download-sections", f"*{a}-{b}",
             "-o", str(d / "video.%(ext)s"), p.url,
@@ -188,7 +199,11 @@ def work(job_id, p: JobIn):
             srt = f"sub_{i}.srt"
             write_srt(segs, c["start"], c["end"], d / srt)
             name = cut(video, d, i, c["start"], c["end"], srt, p)
-            j["clips"].append({"title": c["title"], "file": f"/files/{job_id}/{name}"})
+            j["clips"].append({
+                "title": c["title"],
+                "file": f"/files/{job_id}/{name}",
+                "srt": f"/files/{job_id}/{srt}",
+            })
 
         video.unlink(missing_ok=True)
         (d / "audio.mp3").unlink(missing_ok=True)
@@ -206,7 +221,7 @@ def create_job(p: JobIn):
     if not LOCK.acquire(blocking=False):
         raise HTTPException(429, "Já existe um corte em andamento. Espere terminar.")
     try:
-        p.max_min = min(max(p.max_min, 1), 30)
+        p.max_min = min(max(p.max_min, 1), 20)
         p.clips = min(max(p.clips, 1), 8)
         for old in WORK.iterdir():
             shutil.rmtree(old, ignore_errors=True)
@@ -230,9 +245,10 @@ def get_job(job_id: str):
 @app.get("/files/{job_id}/{name}")
 def get_file(job_id: str, name: str):
     f = (WORK / job_id / name).resolve()
-    if WORK.resolve() not in f.parents or not f.exists() or f.suffix != ".mp4":
+    if WORK.resolve() not in f.parents or not f.exists() or f.suffix not in (".mp4", ".srt"):
         raise HTTPException(404)
-    return FileResponse(f, media_type="video/mp4", filename=name)
+    mt = "video/mp4" if f.suffix == ".mp4" else "text/plain; charset=utf-8"
+    return FileResponse(f, media_type=mt, filename=name)
 
 
 PAGE = """<!doctype html><html lang="pt"><head><meta charset="utf-8">
@@ -251,8 +267,9 @@ video{width:100%;border-radius:8px}a{color:#a78bfa}
 <div class="row"><div><label>Nº de clipes</label><input id="clips" type="number" value="5"></div>
 <div><label>Duração (s)</label><input id="clip_sec" type="number" value="45"></div></div>
 <label>Webcam na live (0 a 1): x, y, largura, altura</label>
-<div class="row"><input id="cam_x" value="0"><input id="cam_y" value="0.7">
-<input id="cam_w" value="0.3"><input id="cam_h" value="0.3"></div>
+<div class="row"><input id="cam_x" value="0.75"><input id="cam_y" value="0.02">
+<input id="cam_w" value="0.24"><input id="cam_h" value="0.24"></div>
+<label style="display:flex;gap:8px;align-items:center;font-size:15px;opacity:1"><input id="fast" type="checkbox" checked style="width:auto;margin:0"> Modo rápido (sem layout vertical)</label>
 <button id="btn" onclick="go()">Gerar cortes</button>
 <p id="msg"></p><div id="out"></div>
 <script>
@@ -261,7 +278,7 @@ const msg=t=>document.getElementById('msg').textContent=t;
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function go(){
   const body={url:g('url'),start_min:+g('start_min'),max_min:+g('max_min'),clips:+g('clips'),
-    clip_sec:+g('clip_sec'),cam_x:+g('cam_x'),cam_y:+g('cam_y'),cam_w:+g('cam_w'),cam_h:+g('cam_h')};
+    clip_sec:+g('clip_sec'),cam_x:+g('cam_x'),cam_y:+g('cam_y'),cam_w:+g('cam_w'),cam_h:+g('cam_h'),fast:document.getElementById('fast').checked};
   document.getElementById('out').innerHTML='';
   msg('Enviando...');
   try{
@@ -282,7 +299,7 @@ async function poll(id){
   }
   msg(j.msg);
   document.getElementById('out').innerHTML=j.clips.map(c=>
-    `<p><b>${esc(c.title)}</b></p><video controls playsinline src="${c.file}"></video><a href="${c.file}" download>Baixar</a>`).join('');
+    `<p><b>${esc(c.title)}</b></p><video controls playsinline src="${c.file}"></video><a href="${c.file}" download>Baixar</a> &nbsp; <a href="${c.srt}" download>Legenda (.srt)</a>`).join('');
   if(j.status==='running') setTimeout(()=>poll(id),4000);
 }
 </script></body></html>"""
@@ -308,4 +325,4 @@ def testar():
         info["groq_resposta"] = r.text[:300]
     except Exception as e:
         info["erro"] = str(e)
-    return info          
+    return info
