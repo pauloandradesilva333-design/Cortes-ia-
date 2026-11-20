@@ -1,5 +1,6 @@
-import json
+  import json
 import os
+import shutil
 import subprocess
 import threading
 import uuid
@@ -12,9 +13,10 @@ from pydantic import BaseModel
 
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 LANG = os.environ.get("LANG_CODE", "pt")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 WORK = Path("/tmp/cortes")
 WORK.mkdir(exist_ok=True)
+LOCK = threading.Lock()
 
 app = FastAPI()
 JOBS = {}
@@ -128,17 +130,21 @@ def cut(video, d, idx, a, b, srt_name, p: JobIn):
     out = f"clip_{idx}.mp4"
     style = "FontName=DejaVu Sans,FontSize=11,Bold=1,Alignment=2,MarginV=130,Outline=2,Shadow=0"
     fc = (
-        f"[0:v]split=2[a][b];"
+        "[0:v]split=2[a][b];"
         f"[a]crop=iw*{p.cam_w}:ih*{p.cam_h}:iw*{p.cam_x}:ih*{p.cam_y},"
-        f"scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
-        f"[b]scale=-2:1280,crop=1080:1280[game];"
+        "scale=1080:640:force_original_aspect_ratio=increase,crop=1080:640[cam];"
+        "[b]crop='min(iw,ih*1080/1280)':ih,scale=1080:1280[game];"
         f"[cam][game]vstack=2,subtitles={srt_name}:force_style='{style}'[v]"
     )
     run(
         [
-            "ffmpeg", "-y", "-ss", str(a), "-to", str(b), "-i", str(video),
+            "ffmpeg", "-loglevel", "error", "-nostats", "-y",
+            "-threads", "1", "-filter_complex_threads", "1",
+            "-ss", str(a), "-i", str(video), "-t", str(round(b - a, 2)),
             "-filter_complex", fc, "-map", "[v]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
+            "-x264-params", "rc-lookahead=0:ref=1:bframes=0:threads=1",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
         ],
         cwd=d,
@@ -149,13 +155,13 @@ def cut(video, d, idx, a, b, srt_name, p: JobIn):
 def work(job_id, p: JobIn):
     j = JOBS[job_id]
     d = WORK / job_id
-    d.mkdir(exist_ok=True)
     try:
+        d.mkdir(exist_ok=True)
         j["msg"] = "Baixando a live..."
         a = int(p.start_min * 60)
         b = a + int(p.max_min * 60)
         run([
-            "yt-dlp", "-f", "bv*[height<=720]+ba/b[height<=720]/b",
+            "yt-dlp", "--no-progress", "-f", "bv*[height<=720]+ba/b[height<=720]/b",
             "--merge-output-format", "mp4",
             "--download-sections", f"*{a}-{b}",
             "-o", str(d / "video.%(ext)s"), p.url,
@@ -163,7 +169,8 @@ def work(job_id, p: JobIn):
         video = next(d.glob("video.*"))
 
         j["msg"] = "Extraindo áudio..."
-        run(["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
+        run(["ffmpeg", "-loglevel", "error", "-nostats", "-y", "-threads", "1",
+             "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
              "-b:a", "32k", str(d / "audio.mp3")])
 
         j["msg"] = "Transcrevendo..."
@@ -184,18 +191,32 @@ def work(job_id, p: JobIn):
             j["clips"].append({"title": c["title"], "file": f"/files/{job_id}/{name}"})
 
         video.unlink(missing_ok=True)
+        (d / "audio.mp3").unlink(missing_ok=True)
         j["status"], j["msg"] = "done", "Pronto!"
     except Exception as e:
         j["status"], j["msg"] = "error", f"Erro: {e}"
+    finally:
+        LOCK.release()
 
 
 @app.post("/jobs")
 def create_job(p: JobIn):
     if not GROQ_KEY:
         raise HTTPException(500, "GROQ_API_KEY não configurada")
-    job_id = uuid.uuid4().hex[:10]
-    JOBS[job_id] = {"status": "running", "msg": "Na fila...", "clips": []}
-    threading.Thread(target=work, args=(job_id, p), daemon=True).start()
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(429, "Já existe um corte em andamento. Espere terminar.")
+    try:
+        p.max_min = min(max(p.max_min, 1), 30)
+        p.clips = min(max(p.clips, 1), 8)
+        for old in WORK.iterdir():
+            shutil.rmtree(old, ignore_errors=True)
+        JOBS.clear()
+        job_id = uuid.uuid4().hex[:10]
+        JOBS[job_id] = {"status": "running", "msg": "Na fila...", "clips": []}
+        threading.Thread(target=work, args=(job_id, p), daemon=True).start()
+    except Exception:
+        LOCK.release()
+        raise
     return {"id": job_id}
 
 
@@ -232,22 +253,34 @@ video{width:100%;border-radius:8px}a{color:#a78bfa}
 <label>Webcam na live (0 a 1): x, y, largura, altura</label>
 <div class="row"><input id="cam_x" value="0"><input id="cam_y" value="0.7">
 <input id="cam_w" value="0.3"><input id="cam_h" value="0.3"></div>
-<button onclick="go()">Gerar cortes</button>
+<button id="btn" onclick="go()">Gerar cortes</button>
 <p id="msg"></p><div id="out"></div>
 <script>
 const g=id=>document.getElementById(id).value;
+const msg=t=>document.getElementById('msg').textContent=t;
 const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function go(){
   const body={url:g('url'),start_min:+g('start_min'),max_min:+g('max_min'),clips:+g('clips'),
     clip_sec:+g('clip_sec'),cam_x:+g('cam_x'),cam_y:+g('cam_y'),cam_w:+g('cam_w'),cam_h:+g('cam_h')};
   document.getElementById('out').innerHTML='';
-  const r=await fetch('/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok){document.getElementById('msg').textContent='Erro ao iniciar';return}
-  poll((await r.json()).id);
+  msg('Enviando...');
+  try{
+    const r=await fetch('/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){const e=await r.json().catch(()=>({}));msg(e.detail||'Erro ao iniciar');return}
+    poll((await r.json()).id);
+  }catch(e){msg('Sem conexão com o servidor. Espere um pouco e tente de novo.')}
 }
 async function poll(id){
-  const j=await (await fetch('/jobs/'+id)).json();
-  document.getElementById('msg').textContent=j.msg;
+  let j;
+  try{
+    const r=await fetch('/jobs/'+id);
+    if(r.status===404){msg('O servidor reiniciou e perdeu o trabalho. Toque em Gerar cortes de novo.');return}
+    j=await r.json();
+  }catch(e){
+    msg('Conexão perdida, tentando de novo...');
+    setTimeout(()=>poll(id),5000);return
+  }
+  msg(j.msg);
   document.getElementById('out').innerHTML=j.clips.map(c=>
     `<p><b>${esc(c.title)}</b></p><video controls playsinline src="${c.file}"></video><a href="${c.file}" download>Baixar</a>`).join('');
   if(j.status==='running') setTimeout(()=>poll(id),4000);
@@ -258,6 +291,8 @@ async function poll(id){
 @app.get("/", response_class=HTMLResponse)
 def home():
     return PAGE
+
+
 @app.get("/testar")
 def testar():
     k = GROQ_KEY
@@ -265,6 +300,7 @@ def testar():
         "tamanho_da_chave": len(k),
         "comeca_com_gsk": k.startswith("gsk_"),
         "tem_espaco_sobrando": k != k.strip(),
+        "modelo": LLM_MODEL,
     }
     try:
         r = httpx.get("https://api.groq.com/openai/v1/models", headers=auth(), timeout=20)
@@ -272,4 +308,4 @@ def testar():
         info["groq_resposta"] = r.text[:300]
     except Exception as e:
         info["erro"] = str(e)
-    return info
+    return info          
