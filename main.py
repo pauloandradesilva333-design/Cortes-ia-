@@ -326,3 +326,21 @@ def testar():
     except Exception as e:
         info["erro"] = str(e)
     return info
+def notify_make(clips):
+    url = os.environ.get("MAKE_WEBHOOK_URL", "")
+    if not url:
+        return
+    base = os.environ.get("PUBLIC_URL", "https://cortes-ia-4cgk.onrender.com")
+    for c in clips:
+        try:
+            httpx.post(
+                url,
+                json={
+                    "title": c["title"],
+                    "video_url": base + c["file"],
+                    "srt_url": base + c["srt"],
+                },
+                timeout=30,
+            )
+        except Exception:
+            pass
