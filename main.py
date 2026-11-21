@@ -70,8 +70,9 @@ def pick_clips(segs, n, sec):
     total = int(segs[-1]["end"]) if segs else 0
     prompt = (
         f"Abaixo está a transcrição de uma live, com o tempo em segundos entre colchetes. "
-        f"Escolha os {n} melhores momentos para cortes de TikTok (engraçados, "
-        f"emocionantes, polêmicos ou com reação forte). Cada corte deve ter cerca de "
+                f"Escolha os {n} melhores momentos para cortes de TikTok. Critério: "
+        + os.environ.get("CRITERIOS", "momentos legais, empolgantes, com muita ação ou que façam rir (risadas, reações exageradas, gritos de empolgação, vitórias, quase morte, fails engraçados). Evite trechos parados, silêncio, leitura de chat e explicações longas.")
+        + f" Cada corte deve ter cerca de "
         f"{sec} segundos, começar no início de uma fala e não pode se sobrepor aos outros. "
         f"Duração total disponível: {total}s. Responda SOMENTE em JSON no formato "
         f'{{"clips":[{{"start":0,"end":45,"title":"título curto"}}]}}.\n\n{transcript}'
